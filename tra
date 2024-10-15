@@ -1,0 +1,123 @@
+import yfinance as yf
+import pandas as pd
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import streamlit as st
+import plotly.graph_objs as go
+
+# Chiave API per Alpha Vantage (opzionale se cambi provider in futuro)
+AV_API_KEY = 'C38L0RDQY0BPDQSD'
+
+# Funzione per scaricare i dati di Apple e salvarli in un file CSV in formato standard
+def download_and_save_apple_data():
+    # Scarica i dati degli ultimi 2 anni
+    df = yf.download('AAPL', period='2y')
+    
+    # Standardizza il formato dei dati
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+    
+    # Salva i dati in locale
+    file_name = 'applestandard.csv'
+    df.to_csv(file_name, index=True)
+    
+    print(f"Dati di Apple salvati in {file_name}")
+
+# Controlla se esiste il file locale, altrimenti scarica i dati
+if not os.path.exists('applestandard.csv'):
+    download_and_save_apple_data()
+
+# Carica i dati dal file CSV
+df = pd.read_csv('applestandard.csv', parse_dates=['Date'], index_col='Date')
+
+# Definizione del modello Transformer
+class TransformerModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.1):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.transformer = nn.Transformer(d_model=input_size, nhead=8, num_encoder_layers=num_layers, num_decoder_layers=num_layers, dim_feedforward=hidden_size, dropout=dropout)
+        self.fc = nn.Linear(input_size, output_size)
+
+    def forward(self, src):
+        output = self.transformer(src, src)
+        output = self.fc(output[-1])  # Usa l'ultimo token per la predizione
+        return output
+
+# Funzione per preparare i dati
+def prepare_data(df, input_size):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    data_scaled = scaler.fit_transform(df['Close'].values.reshape(-1, 1))
+
+    # Prepariamo i dati in input e target per la previsione (lookback sequence)
+    def create_sequences(data, seq_length):
+        xs = []
+        ys = []
+        for i in range(len(data) - seq_length):
+            x = data[i:i + seq_length]
+            y = data[i + seq_length]
+            xs.append(x)
+            ys.append(y)
+        return np.array(xs), np.array(ys)
+
+    seq_length = input_size
+    X, y = create_sequences(data_scaled, seq_length)
+    X = torch.tensor(X, dtype=torch.float32)
+    y = torch.tensor(y, dtype=torch.float32)
+    return X, y, scaler
+
+# Prepara i dati per il modello
+input_size = 30  # Numero di giorni di lookback
+X, y, scaler = prepare_data(df, input_size)
+
+# Inizializza il modello
+hidden_size = 64
+num_layers = 2
+output_size = 1
+model = TransformerModel(input_size, hidden_size, num_layers, output_size)
+
+# Ottimizzatore e funzione di perdita
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Allenamento del modello
+epochs = 50
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    output = model(X.unsqueeze(1))
+    loss = criterion(output.squeeze(), y)
+    loss.backward()
+    optimizer.step()
+    if epoch % 10 == 0:
+        print(f'Epoch {epoch}, Loss: {loss.item()}')
+
+# Funzione per fare previsioni con il modello
+def predict(model, X, scaler):
+    model.eval()
+    with torch.no_grad():
+        prediction = model(X.unsqueeze(1))[-1]  # Predice l'ultimo punto
+    return scaler.inverse_transform(prediction.detach().numpy().reshape(-1, 1))
+
+# Previsione del prezzo di chiusura per oggi
+prediction = predict(model, X[-input_size:], scaler)
+print(f"Previsione del prezzo di chiusura di Apple per oggi: {prediction[0][0]:.2f}")
+
+# Creazione della pagina Streamlit
+st.title('Previsione del prezzo del titolo Apple con Transformers')
+
+# Grafico storico dei prezzi
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Prezzo di chiusura'))
+
+# Aggiungere la previsione come ultimo punto
+last_date = df.index[-1]
+fig.add_trace(go.Scatter(x=[last_date + pd.Timedelta(days=1)], y=[prediction[0][0]], mode='markers', name='Previsione per oggi'))
+
+# Visualizza il grafico
+st.plotly_chart(fig)
+
+# Visualizzare le statistiche della rete
+st.subheader('Statistiche della rete Transformers')
+st.write(f'Errore quadratico medio (MSE) durante l\'allenamento: {loss.item():.5f}')
